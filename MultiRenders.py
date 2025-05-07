@@ -487,6 +487,204 @@ class RENDER_OT_convert_to_mp4(bpy.types.Operator):
         
         return None
 
+class RENDER_OT_export_mp4_batch(bpy.types.Operator):
+    bl_idname = "render.export_mp4_batch"
+    bl_label = "Export MP4 Conversion Batch"
+    bl_description = "Export a batch file to convert rendered image sequences to MP4"
+    
+    filepath: StringProperty(
+        subtype='FILE_PATH',
+    )
+    
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.multi_render_settings
+        return len([p for p in settings.profiles if p.is_enabled]) > 0
+        
+    def execute(self, context):
+        if not self.filepath:
+            self.report({'ERROR'}, "No filepath specified")
+            return {'CANCELLED'}
+                
+        settings = context.scene.multi_render_settings
+        blend_filepath = bpy.data.filepath
+                
+        if not blend_filepath:
+            self.report({'ERROR'}, "Save your .blend file first")
+            return {'CANCELLED'}
+                
+        is_windows = platform.system() == "Windows"
+        ext = ".bat" if is_windows else ".sh"
+                
+        # ファイル拡張子の確認と追加
+        if not self.filepath.endswith(ext):
+            self.filepath += ext
+                
+        # 有効なプロファイルをフィルタリング
+        enabled_profiles = [(i, p) for i, p in enumerate(settings.profiles) if p.is_enabled]
+                
+        if not enabled_profiles:
+            self.report({'ERROR'}, "No enabled profiles available")
+            return {'CANCELLED'}
+                
+        with open(self.filepath, 'w', encoding='utf-8') as f:
+            # バッチファイルヘッダー
+            if is_windows:
+                f.write("@echo off\n")
+                f.write("echo MP4 Conversion batch started\n")
+                f.write("echo.\n\n")
+            else:
+                f.write("#!/bin/bash\n")
+                f.write("echo \"MP4 Conversion batch started\"\n")
+                f.write("echo\n\n")
+                    
+            # FFmpegパスの推測とパスの設定
+            f.write("REM Configure FFmpeg path here if needed\n" if is_windows else "# Configure FFmpeg path here if needed\n")
+            if is_windows:
+                f.write("set FFMPEG_PATH=ffmpeg\n\n")
+                ffmpeg_path = "%FFMPEG_PATH%"
+            else:
+                f.write("FFMPEG_PATH=ffmpeg\n\n")
+                ffmpeg_path = "$FFMPEG_PATH"
+                    
+            # レンダリング設定からファイル形式を取得
+            file_format = context.scene.render.image_settings.file_format.lower()
+                
+            # 一般的な画像ファイル拡張子の対応表
+            format_extensions = {
+                'png': 'png',
+                'jpeg': 'jpg',
+                'tiff': 'tif',
+                'open_exr': 'exr',
+                'targa': 'tga',
+                'bmp': 'bmp'
+            }
+                
+            extension = format_extensions.get(file_format, 'png')
+                
+            # フレームレートを取得
+            fps = context.scene.render.fps / context.scene.render.fps_base
+                
+            # 各プロファイルの変換コマンドを生成
+            for idx, (profile_idx, profile) in enumerate(enabled_profiles):
+                common_path = settings.common_output_path
+                profile_path = profile.output_path
+                
+                # 共通パスを絶対パスに変換
+                common_abs_path = bpy.path.abspath(common_path)
+                
+                # プロファイルのファイル名部分とディレクトリ部分を分離
+                profile_dir = os.path.dirname(profile_path)
+                profile_file = os.path.basename(profile_path)
+                
+                # ファイル名部分から####パターンを検出
+                hash_pattern = re.search(r'#+', profile_file)
+                
+                if hash_pattern:
+                    # ####より前の部分
+                    prefix = profile_file[:hash_pattern.start()]
+                    # ####より後の部分
+                    suffix = profile_file[hash_pattern.end():]
+                    
+                    # 拡張子を確認・追加
+                    if not suffix.endswith(f".{extension}"):
+                        suffix = f"{suffix}.{extension}" if suffix else f".{extension}"
+                    
+                    # Windowsバッチファイルの場合は%を%%に置き換え
+                    if is_windows:
+                        file_pattern = f"{prefix}%%04d{suffix}"
+                    else:
+                        file_pattern = f"{prefix}%04d{suffix}"
+                else:
+                    # 拡張子を含めたパターンを作成
+                    base_name = os.path.splitext(profile_file)[0]
+                    if is_windows:
+                        file_pattern = f"{base_name}%%04d.{extension}"
+                    else:
+                        file_pattern = f"{base_name}%04d.{extension}"
+                
+                # プロファイルディレクトリと共通パスを結合
+                if profile_dir:
+                    if profile_dir.startswith("//"):
+                        profile_dir = profile_dir[2:]
+                    input_dir = os.path.join(common_abs_path, profile_dir)
+                else:
+                    input_dir = common_abs_path
+                
+                # 最終的な入力パスを構築
+                input_path = os.path.normpath(os.path.join(input_dir, file_pattern))
+                
+                # MP4出力ファイル名
+                mp4_filename = f"{profile.name}.mp4"
+                mp4_filename = re.sub(r'[<>:"/\\|?*]', '_', mp4_filename)
+                
+                # MP4出力パスを構築
+                mp4_output = os.path.normpath(os.path.join(common_abs_path, mp4_filename))
+                
+                # FFMPEGコマンド
+                if extension == 'exr':
+                    if is_windows:
+                        f.write(f"echo Converting {profile.name} (EXR sequence) to MP4...\n")
+                        f.write(f"{ffmpeg_path} -framerate {fps} -start_number {profile.start_frame} ")
+                        f.write(f"-i \"{input_path}\" -c:v libx264 -pix_fmt yuv420p -crf 18 ")
+                        f.write(f"-preset slow -colorspace bt709 -y \"{mp4_output}\"\n")
+                        f.write("if %ERRORLEVEL% neq 0 echo Error converting to MP4!\n")
+                        f.write("echo.\n\n")
+                    else:
+                        f.write(f"echo \"Converting {profile.name} (EXR sequence) to MP4...\"\n")
+                        f.write(f"{ffmpeg_path} -framerate {fps} -start_number {profile.start_frame} ")
+                        f.write(f"-i \"{input_path}\" -c:v libx264 -pix_fmt yuv420p -crf 18 ")
+                        f.write(f"-preset slow -colorspace bt709 -y \"{mp4_output}\"\n")
+                        f.write("if [ $? -ne 0 ]; then echo \"Error converting to MP4!\"; fi\n")
+                        f.write("echo\n\n")
+                else:
+                    if is_windows:
+                        f.write(f"echo Converting {profile.name} ({extension} sequence) to MP4...\n")
+                        f.write(f"{ffmpeg_path} -framerate {fps} -start_number {profile.start_frame} ")
+                        f.write(f"-i \"{input_path}\" -c:v libx264 -pix_fmt yuv420p -vf format=yuv420p ")
+                        f.write(f"-crf 23 -preset medium -y \"{mp4_output}\"\n")
+                        f.write("if %ERRORLEVEL% neq 0 echo Error converting to MP4!\n")
+                        f.write("echo.\n\n")
+                    else:
+                        f.write(f"echo \"Converting {profile.name} ({extension} sequence) to MP4...\"\n")
+                        f.write(f"{ffmpeg_path} -framerate {fps} -start_number {profile.start_frame} ")
+                        f.write(f"-i \"{input_path}\" -c:v libx264 -pix_fmt yuv420p -vf format=yuv420p ")
+                        f.write(f"-crf 23 -preset medium -y \"{mp4_output}\"\n")
+                        f.write("if [ $? -ne 0 ]; then echo \"Error converting to MP4!\"; fi\n")
+                        f.write("echo\n\n")
+            
+            # バッチファイルフッター
+            if is_windows:
+                f.write("echo All MP4 conversion tasks completed\n")
+                f.write("pause\n")
+            else:
+                f.write("echo \"All MP4 conversion tasks completed\"\n")
+                f.write("read -p \"Press Enter to continue...\"\n")
+                
+            # シェルスクリプトに実行権限を付与
+            if not is_windows:
+                try:
+                    os.chmod(self.filepath, 0o755)
+                except:
+                    self.report({'WARNING'}, "Could not set executable permissions on the shell script")
+                
+            total_enabled = len(enabled_profiles)
+            self.report({'INFO'}, f"MP4 conversion batch file with {total_enabled} enabled profiles exported to {self.filepath}")
+            return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        # デフォルトのファイル名とパスを設定
+        blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]
+        default_filename = f"{blend_name}_mp4_convert" + (".bat" if platform.system() == "Windows" else ".sh")
+        
+        if bpy.data.filepath:
+            self.filepath = os.path.join(os.path.dirname(bpy.data.filepath), default_filename)
+        else:
+            self.filepath = default_filename
+        
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
 # UI パネル
 # Multi Render Settings Managerパネル
 class RENDER_PT_multi_settings_manager(bpy.types.Panel):
@@ -511,22 +709,30 @@ class RENDER_PT_multi_settings_manager(bpy.types.Panel):
         # システムコンソールボタンとバッチファイル生成ボタン
         row = layout.row()
         row.operator("render.toggle_system_console", icon='CONSOLE')
-        row.operator("render.export_batch_file", icon='FILE_SCRIPT')
-        
-                # 共通出力パス設定
+        row.operator("render.export_batch_file", icon='EXPORT')
+                
+        # 共通出力パス設定
         layout.separator()
         box = layout.box()
-        box.label(text="Common Settings:")
-        
-        # MP4変換ボタンを追加
+        box.label(text="MP4 Conversion:")
+
+        # MP4変換ボタンの行を新しく作成
         if len(settings.profiles) > 0:
-            box.operator("render.convert_to_mp4", icon='SEQUENCE')
+            # 有効なプロファイルがある場合は有効なボタンを表示
+            row1 = box.row()
+            row1.operator("render.convert_to_mp4", icon='SEQUENCE')
+            row1.operator("render.export_mp4_batch", icon='EXPORT')
         else:
-            row = box.row()
-            row.operator("render.convert_to_mp4", icon='SEQUENCE')
-            row.enabled = False
+            # 有効なプロファイルがない場合は無効化されたボタンを表示
+            row1 = box.row()
+            row1.operator("render.convert_to_mp4", icon='SEQUENCE')
+            row1.enabled = False
+            
+            row2 = box.row()
+            row2.operator("render.export_mp4_batch", icon='EXPORT')
+            row2.enabled = False
         
-        box.prop(settings, "common_output_path")
+        # box.prop(settings, "common_output_path")
 
         # 共通出力パス設定
         layout.separator()
@@ -587,7 +793,7 @@ class RENDER_PT_multi_settings_manager(bpy.types.Panel):
                     box.label(text="Warning: Selected camera not found!", icon='ERROR')
                 
                 # レンダリングボタン
-                box.operator("render.render_with_profile", text="Render this camera").profile_index = settings.active_profile_index
+                box.operator("render.render_with_profile", text="Render this camera", icon='RENDER_ANIMATION').profile_index = settings.active_profile_index
             
             # 完全パスの表示
             full_path = os.path.join(settings.common_output_path,
@@ -991,6 +1197,7 @@ classes = (
     RENDER_OT_toggle_system_console,
     RENDER_OT_export_batch_file,
     RENDER_OT_convert_to_mp4,
+    RENDER_OT_export_mp4_batch,
 )
 
 def register():
