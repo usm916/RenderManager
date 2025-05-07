@@ -41,15 +41,15 @@ class RenderSettingsItem(bpy.types.PropertyGroup):
     start_frame: IntProperty(
         name="Start Frame",
         description="First frame to render",
-        default=1,
-        min=1
+        default=0,
+        min=-1000
     )
     
     end_frame: IntProperty(
         name="End Frame",
         description="Last frame to render",
         default=250,
-        min=1
+        min=-1000
     )
     
     camera_name: StringProperty(
