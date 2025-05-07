@@ -11,6 +11,9 @@ bl_info = {
 import bpy
 import os
 import platform
+import re
+import subprocess
+import shlex
 from bpy.props import (StringProperty, IntProperty, PointerProperty, 
                       CollectionProperty, IntProperty, BoolProperty)
 
@@ -222,6 +225,268 @@ class RENDER_OT_export_batch_file(bpy.types.Operator):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+# Add this new operator for the MP4 conversion
+class RENDER_OT_convert_to_mp4(bpy.types.Operator):
+    bl_idname = "render.convert_to_mp4"
+    bl_label = "Convert Image Sequence to MP4"
+    bl_description = "Convert image sequence in the output folder of the selected profile to MP4"
+    
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.multi_render_settings
+        return len(settings.profiles) > 0 and settings.active_profile_index < len(settings.profiles)
+    
+    def execute(self, context):
+        settings = context.scene.multi_render_settings
+        profile = settings.profiles[settings.active_profile_index]
+        
+        # 出力パスの取得
+        common_path = settings.common_output_path
+        profile_path = profile.output_path
+        
+        # 共通パスを絶対パスに変換
+        if common_path.startswith("//"):
+            common_abs_path = bpy.path.abspath(common_path)
+        else:
+            common_abs_path = common_path
+            
+        # デバッグ情報
+        self.report({'INFO'}, f"共通パス: {common_path} -> 絶対パス: {common_abs_path}")
+        
+        # プロファイルパスの処理
+        if profile_path.startswith("//"):
+            profile_rel_path = profile_path[2:]
+            output_path = os.path.join(common_abs_path, profile_rel_path)
+        elif profile_path.startswith("/"):
+            profile_rel_path = profile_path[1:]
+            output_path = os.path.join(common_abs_path, profile_rel_path)
+        elif os.path.isabs(profile_path):
+            output_path = profile_path
+        else:
+            output_path = os.path.join(common_abs_path, profile_path)
+        
+        # デバッグ情報
+        self.report({'INFO'}, f"プロファイルパス: {profile_path} -> 最終出力パス: {output_path}")
+        
+        # フレーム番号プレースホルダーパターンを除去して出力ディレクトリとファイル名の基本部分を取得
+        # ####パターンを検出
+        pattern_match = re.search(r'#+', output_path)
+        if pattern_match:
+            # ####の連続の長さを取得（何桁の数字か）
+            num_digits = len(pattern_match.group(0))
+            # ####パターンの前のファイル名部分
+            output_path_prefix = output_path[:pattern_match.start()]
+            # ####パターンの後のファイル名部分（拡張子など）
+            output_path_suffix = output_path[pattern_match.end():]
+        else:
+            # ####パターンがなければ、ファイル名の前に%04dを追加する想定
+            output_path_prefix = output_path
+            output_path_suffix = ""
+            num_digits = 4  # デフォルトで4桁
+        
+        # 出力ディレクトリとファイル名ベースを取得
+        output_dir = os.path.dirname(output_path_prefix)
+        filename_base = os.path.basename(output_path_prefix)
+        
+        # 出力ディレクトリが存在するか確認し、なければ作成
+        if not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                self.report({'INFO'}, f"出力ディレクトリを作成しました: {output_dir}")
+            except Exception as e:
+                self.report({'ERROR'}, f"ディレクトリ作成に失敗しました: {str(e)}")
+                return {'CANCELLED'}
+        
+        # レンダリング設定からファイル形式を取得
+        file_format = context.scene.render.image_settings.file_format.lower()
+        
+        # 一般的な画像ファイル拡張子の対応表
+        format_extensions = {
+            'png': 'png',
+            'jpeg': 'jpg',
+            'tiff': 'tif',
+            'open_exr': 'exr',
+            'targa': 'tga',
+            'bmp': 'bmp'
+        }
+        
+        # ファイル拡張子を取得
+        extension = format_extensions.get(file_format, 'png')
+        
+        # 拡張子がすでに指定されているか確認
+        if not output_path_suffix and '.' not in filename_base:
+            output_path_suffix = f".{extension}"
+        
+        # フォルダ内の画像ファイルを検索
+        import glob
+        # 検索パターン（ワイルドカード）
+        search_pattern = os.path.join(output_dir, f"{filename_base}*{output_path_suffix}")
+        self.report({'INFO'}, f"検索パターン: {search_pattern}")
+        files = sorted(glob.glob(search_pattern))
+        
+        if not files:
+            # 代替検索パターン
+            search_pattern = os.path.join(output_dir, f"*.{extension}")
+            self.report({'INFO'}, f"代替検索パターン: {search_pattern}")
+            files = sorted(glob.glob(search_pattern))
+            if not files:
+                self.report({'ERROR'}, f"変換する画像ファイルが見つかりません: {search_pattern}")
+                return {'CANCELLED'}
+        
+        self.report({'INFO'}, f"変換対象: {len(files)}ファイル")
+        
+        # 最初のファイルから連番パターンを抽出
+        first_file = files[0]
+        self.report({'INFO'}, f"最初のファイル: {first_file}")
+        
+        # ファイル名から数字部分を抽出して、FFmpegの%d形式に変換
+        file_basename = os.path.basename(first_file)
+        # 数字部分を抽出
+        match = re.search(r'(\d+)', file_basename)
+        if match:
+            # 見つかった数字の位置
+            num_pos = match.start()
+            # 数字の長さ
+            num_length = len(match.group(1))
+            # 最初の番号
+            start_num = int(match.group(1))
+            
+            # FFmpegの入力パターン（%04d形式）を構築
+            input_prefix = os.path.join(output_dir, file_basename[:num_pos])
+            input_suffix = file_basename[num_pos + num_length:]
+            ffmpeg_input = f"{input_prefix}%0{num_length}d{input_suffix}"
+            
+            self.report({'INFO'}, f"FFmpeg入力パターン: {ffmpeg_input}, 開始番号: {start_num}")
+        else:
+            # 数字部分が見つからない場合は、単一ファイルとして処理
+            self.report({'WARNING'}, "ファイル名に連番が見つかりません。単一ファイルとして処理します。")
+            ffmpeg_input = first_file
+            start_num = 1
+        
+        # MP4出力ファイル名を共通パスに設定
+        # プロファイルのパス構造を反映したファイル名を作成
+        if profile_path.startswith("//") or profile_path.startswith("/"):
+            # 相対パスの場合、ディレクトリ構造を取得
+            if profile_path.startswith("//"):
+                dir_structure = profile_path[2:]
+            else:
+                dir_structure = profile_path[1:]
+                
+            # ディレクトリ区切り文字をアンダースコアに置換
+            dir_structure = dir_structure.replace('/', '_').replace('\\', '_')
+            
+            # ####などの連番部分を除去
+            dir_structure = re.sub(r'#*', '', dir_structure)
+            
+            # ファイル名をプロファイル名+ディレクトリ構造で作成
+            mp4_filename = f"{profile.name}_{dir_structure}.mp4"
+        else:
+            # 絶対パスの場合はプロファイル名のみ
+            mp4_filename = f"{profile.name}.mp4"
+        
+        # 特殊文字をアンダースコアに置換して安全なファイル名にする
+        mp4_filename = re.sub(r'[<>:"/\\|?*]', '_', mp4_filename)
+        
+        # 共通パスにMP4ファイルを出力
+        mp4_output = os.path.join(common_abs_path, mp4_filename)
+        
+        # MP4出力先ディレクトリの存在確認と作成
+        mp4_output_dir = os.path.dirname(mp4_output)
+        if not os.path.exists(mp4_output_dir):
+            try:
+                os.makedirs(mp4_output_dir, exist_ok=True)
+                self.report({'INFO'}, f"MP4出力ディレクトリを作成しました: {mp4_output_dir}")
+            except Exception as e:
+                self.report({'ERROR'}, f"MP4出力ディレクトリ作成に失敗しました: {str(e)}")
+                return {'CANCELLED'}
+        
+        # FFmpegのパスを取得
+        ffmpeg_path = self.get_ffmpeg_path()
+        if not ffmpeg_path:
+            self.report({'ERROR'}, "FFmpegが見つかりません")
+            return {'CANCELLED'}
+        
+        # フレームレートを取得
+        fps = context.scene.render.fps / context.scene.render.fps_base
+        
+        # FFmpegコマンドの構築 - alpha_modeを削除
+        if extension == 'exr':
+            cmd = [
+                ffmpeg_path,
+                '-framerate', str(fps),
+                '-start_number', str(start_num),
+                '-i', ffmpeg_input,
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-crf', '18',
+                '-preset', 'slow',
+                '-colorspace', 'bt709',
+                '-y',
+                mp4_output
+            ]
+        else:
+            cmd = [
+                ffmpeg_path,
+                '-framerate', str(fps),
+                '-start_number', str(start_num),
+                '-i', ffmpeg_input,
+                '-c:v', 'libx264',
+                '-pix_fmt', 'yuv420p',
+                '-vf', 'format=yuv420p',
+                '-crf', '23',
+                '-preset', 'medium',
+                '-y',
+                mp4_output
+            ]
+
+        try:
+            # コマンド実行
+            cmd_str = ' '.join(cmd)
+            self.report({'INFO'}, f"FFmpegコマンド: {cmd_str}")
+            process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            stdout, stderr = process.communicate()
+            
+            if process.returncode != 0:
+                self.report({'ERROR'}, f"MP4変換に失敗しました: {stderr}")
+                return {'CANCELLED'}
+            
+            self.report({'INFO'}, f"MP4ファイルが作成されました: {mp4_output}")
+            return {'FINISHED'}
+        
+        except Exception as e:
+            self.report({'ERROR'}, f"エラーが発生しました: {str(e)}")
+            return {'CANCELLED'}
+    
+    def get_ffmpeg_path(self):
+        """FFmpegのパスを取得する"""
+        # Blender同梱のFFmpegパスを探す
+        blender_bin = bpy.app.binary_path
+        blender_dir = os.path.dirname(blender_bin)
+        
+        # 潜在的なFFmpegのパス
+        possible_paths = [
+            # Windows
+            os.path.join(blender_dir, 'ffmpeg.exe'),
+            # macOS
+            os.path.join(os.path.dirname(blender_dir), 'Resources', 'ffmpeg'),
+            # Linux
+            os.path.join(blender_dir, 'ffmpeg'),
+            # システムパス上のFFmpeg
+            'ffmpeg'
+        ]
+        
+        # 存在するパスを返す
+        for path in possible_paths:
+            if os.path.exists(path) or path == 'ffmpeg':
+                return path
+        
+        return None
+
 # UI パネル
 # Multi Render Settings Managerパネル
 class RENDER_PT_multi_settings_manager(bpy.types.Panel):
@@ -248,6 +513,21 @@ class RENDER_PT_multi_settings_manager(bpy.types.Panel):
         row.operator("render.toggle_system_console", icon='CONSOLE')
         row.operator("render.export_batch_file", icon='FILE_SCRIPT')
         
+                # 共通出力パス設定
+        layout.separator()
+        box = layout.box()
+        box.label(text="Common Settings:")
+        
+        # MP4変換ボタンを追加
+        if len(settings.profiles) > 0:
+            box.operator("render.convert_to_mp4", icon='SEQUENCE')
+        else:
+            row = box.row()
+            row.operator("render.convert_to_mp4", icon='SEQUENCE')
+            row.enabled = False
+        
+        box.prop(settings, "common_output_path")
+
         # 共通出力パス設定
         layout.separator()
         box = layout.box()
@@ -277,12 +557,12 @@ class RENDER_PT_multi_settings_manager(bpy.types.Panel):
             # タイトル行：名前、Set ボタン、展開トグル
             row = box.row()
             name_row = row.row()
-            name_row.prop(profile, "name")
+            name_row.prop(profile, "Prof name")
             
             # 右側にSetボタンとexpandトグルを配置
             buttons_row = row.row(align=True)
             # "Set As Active Camera"ボタンを"Set"という短い名前に変更して配置
-            op = buttons_row.operator("render.set_active_camera_from_profile", text="Set", icon='CAMERA_DATA')
+            op = buttons_row.operator("render.set_active_camera_from_profile", text="set as Active", icon='CAMERA_DATA')
             op.profile_index = settings.active_profile_index
             # 展開ボタン
             buttons_row.prop(profile, "is_expanded", icon='DOWNARROW_HLT' if profile.is_expanded else 'RIGHTARROW', emboss=False)
@@ -307,7 +587,7 @@ class RENDER_PT_multi_settings_manager(bpy.types.Panel):
                     box.label(text="Warning: Selected camera not found!", icon='ERROR')
                 
                 # レンダリングボタン
-                box.operator("render.render_with_profile", text="Render").profile_index = settings.active_profile_index
+                box.operator("render.render_with_profile", text="Render this camera").profile_index = settings.active_profile_index
             
             # 完全パスの表示
             full_path = os.path.join(settings.common_output_path,
@@ -710,6 +990,7 @@ classes = (
     RENDER_OT_render_all_profiles,
     RENDER_OT_toggle_system_console,
     RENDER_OT_export_batch_file,
+    RENDER_OT_convert_to_mp4,
 )
 
 def register():
